@@ -2436,3 +2436,26 @@ def test_initial_camera_not_overridden_by_step_image():
     key = f"{OBS_IMAGES}.front"
     assert key in out
     assert out[key]["shape"] == (240, 320, 3)  # from the step, not from initial
+
+
+def test_resolve_step_class_rejects_non_processor_step():
+    """Processor configs can come from untrusted Hub repos.
+
+    `_resolve_step_class` imports the dotted path in a config's "class" field and
+    the caller then calls it as `step_class(**config)`, so resolving to anything
+    other than a ProcessorStep subclass is arbitrary-callable invocation.
+    """
+    for dotted_path in ("subprocess.Popen", "os.system", "builtins.eval"):
+        with pytest.raises(ImportError, match="not a ProcessorStep subclass"):
+            DataProcessorPipeline._resolve_step_class({"class": dotted_path})
+
+
+def test_resolve_step_class_still_loads_legitimate_step():
+    """The hardening must not break out-of-tree steps loaded by dotted path."""
+    step_class, step_key = DataProcessorPipeline._resolve_step_class(
+        {"class": "lerobot.processor.normalize_processor.NormalizerProcessorStep"}
+    )
+    assert step_key == "NormalizerProcessorStep"
+    assert issubclass(step_class, ProcessorStep)
+
+
