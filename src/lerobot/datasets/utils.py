@@ -19,7 +19,7 @@ import importlib.resources
 import json
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import datasets
 import numpy as np
@@ -101,6 +101,74 @@ LEGACY_EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
 LEGACY_TASKS_PATH = "meta/tasks.jsonl"
 
 
+def _reject_path_escape(field_name: str, value: str, reported_as: str | None = None) -> None:
+    """Raise if ``value`` would resolve outside the dataset root once joined onto it.
+
+    Both path flavours are checked. ``PurePosixPath`` treats a backslash as an
+    ordinary character, so it reads ``..\\..\\x`` as a single filename, while
+    ``PureWindowsPath`` splits it into traversal segments — and the reverse holds
+    for a leading ``/``, which only ``PurePosixPath`` calls absolute. Checking one
+    flavour therefore leaves the other's traversals through.
+
+    Args:
+        field_name: Name used in the error message.
+        value: The path fragment to check.
+        reported_as: Value to quote in the error instead of ``value`` — used to
+            report the original template rather than a formatted probe.
+
+    Raises:
+        ValueError: if ``value`` is absolute or contains a ``..`` segment.
+    """
+    shown = value if reported_as is None else reported_as
+
+    for pure in (PurePosixPath(value), PureWindowsPath(value)):
+        if pure.is_absolute():
+            raise ValueError(
+                f"{field_name} must be a relative path, got {shown!r}. "
+                f"Absolute paths escape the dataset root."
+            )
+        if ".." in pure.parts:
+            raise ValueError(
+                f"{field_name} must not contain '..' segments, got {shown!r}. "
+                f"Such paths escape the dataset root."
+            )
+
+
+def _validate_path_template(field_name: str, template: str) -> None:
+    """Reject path templates that would resolve outside the dataset root.
+
+    ``data_path`` / ``video_path`` are read verbatim from ``meta/info.json``,
+    which ships inside a dataset repository and is downloaded from the Hub.
+    Callers join the formatted result onto the dataset root, so an absolute
+    template silently discards the root (``Path("/root") / "/tmp/x"`` is
+    ``/tmp/x``) and a ``..`` template walks out of it. Both the read paths and
+    the writer — which does ``mkdir(parents=True)`` and then writes a parquet
+    file at the joined location — would follow it.
+
+    Note the ``{video_key}`` / ``{image_key}`` placeholders are substituted from
+    the ``features`` dict of the *same* untrusted file, so a probe value proves
+    nothing about them; those keys are validated separately in
+    :meth:`DatasetInfo.__post_init__`.
+
+    Raises:
+        ValueError: if the template is absolute or contains a ``..`` segment.
+    """
+    if not isinstance(template, str) or not template:
+        raise ValueError(f"{field_name} must be a non-empty string, got {template!r}")
+
+    # Check the raw template and a formatted probe: the placeholders themselves
+    # are substituted with caller-controlled values, but a traversal hidden in
+    # the literal portion has to appear in one of the two.
+    candidates = [template]
+    # An unknown placeholder just means the probe is skipped — the literal
+    # segments of the raw template are still checked below.
+    with contextlib.suppress(KeyError, IndexError):
+        candidates.append(template.format(chunk_index=0, file_index=0, video_key="probe", episode_index=0))
+
+    for candidate in candidates:
+        _reject_path_escape(field_name, candidate, reported_as=template)
+
+
 @dataclass
 class DatasetInfo:
     """Typed representation of the ``meta/info.json`` file for a LeRobot dataset.
@@ -151,6 +219,20 @@ class DatasetInfo:
             raise ValueError(f"data_files_size_in_mb must be positive, got {self.data_files_size_in_mb}")
         if self.video_files_size_in_mb <= 0:
             raise ValueError(f"video_files_size_in_mb must be positive, got {self.video_files_size_in_mb}")
+
+        _validate_path_template("data_path", self.data_path)
+        if self.video_path is not None:
+            _validate_path_template("video_path", self.video_path)
+
+        # Feature keys are substituted into `video_path` as `{video_key}` and into
+        # `DEFAULT_IMAGE_PATH` as `{image_key}`, then joined onto the dataset root
+        # by the readers and by `DatasetWriter`. They come from the same untrusted
+        # `meta/info.json` as the templates, so validating the template alone still
+        # leaves `videos/{video_key}/...` with a key of `../../../tmp/evil` able to
+        # escape. Only traversal is rejected — a key containing a plain `/` merely
+        # nests a directory, and rejecting it would break existing datasets.
+        for key in self.features:
+            _reject_path_escape("feature key", key)
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable dict.

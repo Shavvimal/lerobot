@@ -180,3 +180,98 @@ def test_non_dict_passthrough_last_wins():
     out = combine_feature_dicts(g1, g2)
     # For non-dict entries the last one wins
     assert out["misc"] == 456
+
+
+# --- Security: `meta/info.json` ships inside a Hub dataset repo, so its path
+# --- templates are untrusted input that callers join onto the dataset root.
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "../../../../tmp/escaped_{chunk_index}.parquet",
+        "/tmp/absolute_{chunk_index}.parquet",
+        "data/../../../{chunk_index}.parquet",
+        "data/{chunk_index}/../../../../escaped.parquet",
+    ],
+)
+def test_dataset_info_rejects_escaping_data_path(template):
+    """A malicious info.json must not be able to redirect reads or writes.
+
+    `dataset_writer` does `root / data_path.format(...)` followed by
+    `mkdir(parents=True)` and a parquet write, so an escaping template is an
+    arbitrary file write on any resumed or converted Hub dataset.
+    """
+    with pytest.raises(ValueError):
+        dataset_utils.DatasetInfo(codebase_version="v3.0", fps=30, features={}, data_path=template)
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["../../../{video_key}.mp4", "/tmp/{video_key}.mp4"],
+)
+def test_dataset_info_rejects_escaping_video_path(template):
+    with pytest.raises(ValueError):
+        dataset_utils.DatasetInfo(codebase_version="v3.0", fps=30, features={}, video_path=template)
+
+
+def test_dataset_info_accepts_default_path_templates():
+    """The hardening must not reject the templates every real dataset uses."""
+    info = dataset_utils.DatasetInfo(codebase_version="v3.0", fps=30, features={})
+    assert info.data_path == dataset_utils.DEFAULT_DATA_PATH
+    assert info.video_path == dataset_utils.DEFAULT_VIDEO_PATH
+
+    # a dataset with no videos declares video_path = None
+    info = dataset_utils.DatasetInfo(codebase_version="v3.0", fps=30, features={}, video_path=None)
+    assert info.video_path is None
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        r"..\..\..\tmp\escaped_{chunk_index}.parquet",
+        r"data\..\..\..\{chunk_index}.parquet",
+    ],
+)
+def test_dataset_info_rejects_windows_style_escaping_data_path(template):
+    """Backslash traversal must be rejected too.
+
+    `PurePosixPath` reads `..\\..\\x` as a single filename, so checking only the
+    posix flavour lets a Windows traversal through on the platform where it
+    resolves.
+    """
+    with pytest.raises(ValueError):
+        dataset_utils.DatasetInfo(codebase_version="v3.0", fps=30, features={}, data_path=template)
+
+
+@pytest.mark.parametrize(
+    "feature_key",
+    ["../../../tmp/evil", r"..\..\evil", "/tmp/evil"],
+)
+def test_dataset_info_rejects_escaping_feature_keys(feature_key):
+    """Feature keys reach the filesystem through `{video_key}` / `{image_key}`.
+
+    They come from the same untrusted `meta/info.json` as the templates, so a
+    valid-looking `videos/{video_key}/...` template still escapes the root when
+    the key itself is a traversal.
+    """
+    with pytest.raises(ValueError):
+        dataset_utils.DatasetInfo(
+            codebase_version="v3.0",
+            fps=30,
+            features={feature_key: {"dtype": "video", "shape": [3, 8, 8]}},
+        )
+
+
+def test_dataset_info_accepts_realistic_feature_keys():
+    """The hardening must not reject the keys every real dataset uses."""
+    info = dataset_utils.DatasetInfo(
+        codebase_version="v3.0",
+        fps=30,
+        features={
+            "observation.images.front": {"dtype": "video", "shape": [3, 8, 8]},
+            "observation.state": {"dtype": "float32", "shape": [6]},
+            "action": {"dtype": "float32", "shape": [6]},
+        },
+    )
+    assert "observation.images.front" in info.features
