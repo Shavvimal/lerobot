@@ -50,10 +50,16 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.hub import HubMixin
 
 from .converters import batch_to_transition, create_transition, transition_to_batch
+from .hub_trust import remote_code_allowed, trust_remote_code_scope
 
 # Generic type variables for pipeline input and output.
 TInput = TypeVar("TInput")
 TOutput = TypeVar("TOutput")
+
+# Name of the step field carrying remote-code consent. A value found under this
+# key in a saved processor config is never honoured — see
+# `DataProcessorPipeline._strip_config_declared_trust`.
+TRUST_REMOTE_CODE_FIELD = "trust_remote_code"
 
 
 class ProcessorStepRegistry:
@@ -624,6 +630,7 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         overrides: dict[str, Any] | None = None,
         to_transition: Callable[[TInput], EnvTransition] | None = None,
         to_output: Callable[[EnvTransition], TOutput] | None = None,
+        trust_remote_code: bool = False,
         **kwargs,
     ) -> DataProcessorPipeline[TInput, TOutput]:
         """Loads a pipeline from a local directory, single file, or Hugging Face Hub repository.
@@ -731,10 +738,13 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         # 2. Validate configuration and handle migration
         cls._validate_loaded_config(model_id, loaded_config, config_filename)
 
-        # 3. Build steps with overrides
-        steps, validated_overrides = cls._build_steps_with_overrides(
-            loaded_config, overrides or {}, model_id, base_path, hub_download_kwargs, is_local_source
-        )
+        # 3. Build steps with overrides. `trust_remote_code` is scoped to this
+        # build so that a step loading a Hub tokenizer sees the caller's decision
+        # rather than the one written into the config it was downloaded with.
+        with trust_remote_code_scope(trust_remote_code):
+            steps, validated_overrides = cls._build_steps_with_overrides(
+                loaded_config, overrides or {}, model_id, base_path, hub_download_kwargs, is_local_source
+            )
 
         # 4. Validate that all overrides were used
         cls._validate_overrides_used(validated_overrides, loaded_config)
@@ -1095,6 +1105,39 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
 
             return step_class, class_name
 
+    @staticmethod
+    def _strip_config_declared_trust(
+        saved_cfg: dict[str, Any], step_class: type[ProcessorStep]
+    ) -> dict[str, Any]:
+        """Replace a config-declared ``trust_remote_code`` with the caller's decision.
+
+        A step's saved config travels inside the same repository as the code it
+        would execute, so a downloaded ``preprocessor_config.json`` naming a
+        tokenizer repo *and* setting ``"trust_remote_code": true`` would otherwise
+        authorise itself. The value is therefore always discarded and re-derived
+        from the caller's consent (see `lerobot.processor.hub_trust`); explicit
+        `overrides=` still win, because those come from the caller too.
+
+        Args:
+            saved_cfg: The step's config as read from the processor JSON.
+            step_class: The resolved step class, used to check it takes the field.
+
+        Returns:
+            A copy of ``saved_cfg`` with ``trust_remote_code`` set from caller consent.
+        """
+        step_takes_field = TRUST_REMOTE_CODE_FIELD in getattr(step_class, "__dataclass_fields__", {})
+        if not step_takes_field and TRUST_REMOTE_CODE_FIELD not in saved_cfg:
+            return saved_cfg
+
+        sanitized = dict(saved_cfg)
+        if step_takes_field:
+            sanitized[TRUST_REMOTE_CODE_FIELD] = remote_code_allowed()
+        else:
+            # The step cannot consume the field, so a config carrying it is either
+            # stale or crafted. Drop it rather than forwarding it into **kwargs.
+            sanitized.pop(TRUST_REMOTE_CODE_FIELD)
+        return sanitized
+
     @classmethod
     def _instantiate_step(
         cls,
@@ -1144,7 +1187,7 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         try:
             saved_cfg = step_entry.get("config", {})
             step_overrides = overrides.get(step_key, {})
-            merged_cfg = {**saved_cfg, **step_overrides}
+            merged_cfg = {**cls._strip_config_declared_trust(saved_cfg, step_class), **step_overrides}
             return step_class(**merged_cfg)
         except Exception as e:
             step_name = step_entry.get("registry_name", step_entry.get("class", "Unknown"))

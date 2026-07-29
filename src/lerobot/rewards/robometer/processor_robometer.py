@@ -135,6 +135,9 @@ class RobometerEncoderProcessorStep(ProcessorStep):
     use_multi_image: bool = True
     use_per_frame_progress_token: bool = True
     max_length: int = 1024
+    # `base_model_id` is serialized and this step is built from a downloaded
+    # processor config, so remote code stays off unless the caller opts in.
+    trust_remote_code: bool = False
 
     _processor: Any = field(default=None, init=False, repr=False)
 
@@ -144,7 +147,7 @@ class RobometerEncoderProcessorStep(ProcessorStep):
 
         self._processor = AutoProcessor.from_pretrained(
             self.base_model_id,
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
             do_sample_frames=False,
             padding_side="right",
         )

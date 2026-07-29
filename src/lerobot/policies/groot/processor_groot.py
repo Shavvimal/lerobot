@@ -1366,11 +1366,13 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
     return np.concatenate([pad, video], axis=1)
 
 
-def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
+def _build_n1_7_processor(
+    model_name: str = GROOT_N1_7_BACKBONE_MODEL, trust_remote_code: bool = False
+) -> ProcessorMixin:
     require_package("transformers", extra="groot")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=True)
-    video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    image_processor = Qwen2VLImageProcessor.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     proc = Qwen3VLProcessor(
         image_processor=image_processor,
         tokenizer=tokenizer,
@@ -2064,12 +2066,17 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     # to eval and are re-enabled only when processors are built with dataset_meta.
     training: bool = False
     device: str | None = None
+    # `model_name` is serialized and this step is built from a downloaded
+    # `preprocessor_config.json`, so remote code stays off unless the caller opts
+    # in. Captured at construction because `proc` loads lazily, outside the scope
+    # `DataProcessorPipeline` sets during the build.
+    trust_remote_code: bool = False
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
         if self._proc is None:
-            self._proc = _build_n1_7_processor(self.model_name)
+            self._proc = _build_n1_7_processor(self.model_name, trust_remote_code=self.trust_remote_code)
         return self._proc
 
     def _target_device(self) -> torch.device | None:

@@ -135,12 +135,17 @@ class TOPRewardEncoderProcessorStep(ProcessorStep):
     prompt_suffix_template: str = DEFAULT_PROMPT_SUFFIX_TEMPLATE
     add_chat_template: bool = False
     max_length: int = 32768
+    # `vlm_name` is serialized and this step is built from a downloaded processor
+    # config, so remote code stays off unless the caller opts in.
+    trust_remote_code: bool = False
 
     _processor: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         require_package("transformers", extra="topreward")
-        self._processor = AutoProcessor.from_pretrained(self.vlm_name, trust_remote_code=True)
+        self._processor = AutoProcessor.from_pretrained(
+            self.vlm_name, trust_remote_code=self.trust_remote_code
+        )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION)

@@ -345,7 +345,11 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
 
     action_tokenizer_name: str | None = None
     action_tokenizer_input_object: Any | None = None
-    trust_remote_code: bool = True
+    # Defaults to False: this step is instantiated from `preprocessor_config.json`,
+    # which travels inside the same repository as the code it would execute, so a
+    # config must not be able to declare itself trusted. `DataProcessorPipeline`
+    # overwrites this with the caller's consent when loading.
+    trust_remote_code: bool = False
     max_action_tokens: int = 256
     fast_skip_tokens: int = 128
     paligemma_tokenizer_name: str = "google/paligemma-3b-pt-224"
@@ -547,9 +551,12 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         Returns:
             A dictionary with the processor's configuration parameters.
         """
+        # `trust_remote_code` is deliberately not serialized: it is the caller's
+        # decision, not a property of the checkpoint, and persisting it would let a
+        # downloaded config authorise its own remote-code execution on reload.
         config = {
-            "trust_remote_code": self.trust_remote_code,
             "max_action_tokens": self.max_action_tokens,
+            "paligemma_tokenizer_name": self.paligemma_tokenizer_name,
         }
 
         # Only save tokenizer_name if it was used to create the tokenizer

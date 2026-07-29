@@ -38,6 +38,8 @@ from lerobot.processor import (
     TransitionKey,
 )
 from lerobot.processor.converters import create_transition, identity_transition
+from lerobot.processor.hub_trust import remote_code_allowed, trust_remote_code_scope
+from lerobot.processor.pipeline import IdentityProcessorStep
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STATE, REWARD, TRUNCATED
 from tests.conftest import assert_contract_is_typed
 
@@ -2459,3 +2461,91 @@ def test_resolve_step_class_still_loads_legitimate_step():
     assert issubclass(step_class, ProcessorStep)
 
 
+# --- Security: a processor config travels inside the same repository as the code
+# --- it would execute, so it must not be able to declare itself trusted.
+
+
+@dataclass
+class _RemoteCodeStep(ProcessorStep):
+    """Stand-in for the real steps that load a Hub model by name."""
+
+    model_name: str | None = None
+    trust_remote_code: bool = False
+
+    def __call__(self, transition):
+        return transition
+
+    def transform_features(self, features):
+        return features
+
+    def get_config(self):
+        return {"model_name": self.model_name}
+
+
+def test_config_declared_trust_remote_code_is_ignored():
+    """A downloaded config setting `trust_remote_code: true` must not be honoured.
+
+    This is the second half of the unauthenticated-RPC RCE: closing the pickle
+    route still leaves a peer able to name a Hub repo whose processor config both
+    selects a legitimately-registered step and marks itself trusted.
+    """
+    hostile = {"model_name": "attacker/evil", "trust_remote_code": True}
+
+    sanitized = DataProcessorPipeline._strip_config_declared_trust(hostile, _RemoteCodeStep)
+
+    assert sanitized["trust_remote_code"] is False
+    assert sanitized["model_name"] == "attacker/evil"  # only the trust decision is overridden
+
+
+def test_caller_can_opt_in_to_remote_code():
+    """Explicit caller consent must still work — this is a gate, not a ban."""
+    hostile = {"model_name": "vendor/repo", "trust_remote_code": True}
+
+    with trust_remote_code_scope(True):
+        sanitized = DataProcessorPipeline._strip_config_declared_trust(hostile, _RemoteCodeStep)
+
+    assert sanitized["trust_remote_code"] is True
+
+
+def test_remote_code_consent_does_not_leak_out_of_scope():
+    """Consent is scoped to one load, so one caller cannot widen another's."""
+    with trust_remote_code_scope(True):
+        assert remote_code_allowed() is True
+    assert remote_code_allowed() is False
+
+
+def test_trust_remote_code_dropped_for_steps_that_cannot_take_it():
+    """A config carrying the field for a step without it must not reach **kwargs."""
+    sanitized = DataProcessorPipeline._strip_config_declared_trust(
+        {"a": 1, "trust_remote_code": True}, IdentityProcessorStep
+    )
+    assert "trust_remote_code" not in sanitized
+    assert sanitized == {"a": 1}
+
+
+def test_action_tokenizer_step_defaults_to_not_trusting_remote_code():
+    """The step reachable from a downloaded pi0-fast config must default closed."""
+    from lerobot.processor.tokenizer_processor import ActionTokenizerProcessorStep
+
+    field = ActionTokenizerProcessorStep.__dataclass_fields__["trust_remote_code"]
+    assert field.default is False
+
+
+def test_action_tokenizer_step_does_not_serialize_trust_remote_code():
+    """Persisting consent would let a saved config re-grant itself trust on reload."""
+    from lerobot.processor.tokenizer_processor import ActionTokenizerProcessorStep
+
+    step = ActionTokenizerProcessorStep.__new__(ActionTokenizerProcessorStep)
+    step.action_tokenizer_name = "vendor/repo"
+    step.action_tokenizer_input_object = None
+    step.trust_remote_code = True
+    step.max_action_tokens = 256
+    step.paligemma_tokenizer_name = "google/paligemma-3b-pt-224"
+
+    config = step.get_config()
+
+    assert "trust_remote_code" not in config
+    # ...but the tokenizer identity must round-trip, or the step silently reloads
+    # with the wrong tokenizer for its BOS / "Action: " / "|" encodings.
+    assert config["paligemma_tokenizer_name"] == "google/paligemma-3b-pt-224"
+    assert config["action_tokenizer_name"] == "vendor/repo"

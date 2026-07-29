@@ -137,6 +137,9 @@ class ProcessorConfigKwargs(TypedDict, total=False):
         preprocessor_overrides: A dictionary of overrides for the preprocessor configuration.
         postprocessor_overrides: A dictionary of overrides for the postprocessor configuration.
         dataset_stats: Dataset statistics for normalization.
+        trust_remote_code: Explicit consent to execute code downloaded from the Hub
+            while building processor steps. Defaults to False; a processor config
+            cannot grant this to itself.
     """
 
     preprocessor_config_filename: str | None
@@ -145,6 +148,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     postprocessor_overrides: dict[str, Any] | None
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
     dataset_meta: Any | None
+    trust_remote_code: bool
 
 
 def make_pre_post_processors(
@@ -206,6 +210,7 @@ def make_pre_post_processors(
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
             revision=pretrained_revision,
+            trust_remote_code=kwargs.get("trust_remote_code", False),
         )
         postprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
@@ -216,6 +221,7 @@ def make_pre_post_processors(
             to_transition=policy_action_to_transition,
             to_output=transition_to_policy_action,
             revision=pretrained_revision,
+            trust_remote_code=kwargs.get("trust_remote_code", False),
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
         if isinstance(policy_cfg, Evo1Config):
