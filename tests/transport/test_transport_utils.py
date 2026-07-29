@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import io
+import pathlib
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Event, Queue
 from pickle import UnpicklingError
 
@@ -570,3 +572,130 @@ def test_receive_bytes_in_chunks_unknown_state():
 
     with pytest.raises(ValueError, match="Received unknown transfer state"):
         receive_bytes_in_chunks(bad_iterator, output_queue, shutdown_event)
+
+
+# --- Security regression: the gRPC transport is unauthenticated plaintext, so
+# --- any payload reaching `bytes_to_python_object` is attacker-controlled.
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_bytes_to_python_object_rejects_code_execution_payload(tmp_path):
+    """A `__reduce__` payload must be refused, not executed.
+
+    This is the regression test for the unauthenticated-RPC RCE: a bare
+    `pickle.load` here runs whatever the sender names in `__reduce__`.
+    """
+    import pickle
+
+    from lerobot.transport.utils import bytes_to_python_object
+
+    marker = tmp_path / "pwned"
+
+    class Exploit:
+        def __reduce__(self):
+            return (pathlib.Path.write_text, (marker, "pwned"))
+
+    payload = pickle.dumps(Exploit())
+
+    with pytest.raises(UnpicklingError):
+        bytes_to_python_object(payload)
+
+    assert not marker.exists(), "deserialization executed attacker-controlled code"
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_bytes_to_python_object_rejects_arbitrary_global(tmp_path):
+    """Naming a non-allowlisted callable must fail closed."""
+    import pickle
+
+    from lerobot.transport.utils import bytes_to_python_object
+
+    payload = pickle.dumps({"callable": pathlib.Path.write_text})
+
+    with pytest.raises(UnpicklingError):
+        bytes_to_python_object(payload)
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_python_object_to_bytes_roundtrips_numpy():
+    """Camera frames cross the wire as numpy arrays, so they must survive."""
+    import numpy as np
+
+    from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
+
+    obj = {
+        "observation.images.front": np.zeros((3, 8, 8), dtype=np.uint8),
+        "observation.state": np.arange(6, dtype=np.float32),
+    }
+    reconstructed = bytes_to_python_object(python_object_to_bytes(obj))
+
+    assert np.array_equal(reconstructed["observation.images.front"], obj["observation.images.front"])
+    assert reconstructed["observation.images.front"].dtype == np.uint8
+    assert np.array_equal(reconstructed["observation.state"], obj["observation.state"])
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_python_object_to_bytes_roundtrips_wire_dataclasses():
+    """The async-inference payload types must round-trip through the codec."""
+    from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, TimedObservation
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
+
+    obs = TimedObservation(
+        timestamp=1.5, timestep=3, observation={"observation.state": torch.randn(6)}, must_go=True
+    )
+    got = bytes_to_python_object(python_object_to_bytes(obs))
+    assert isinstance(got, TimedObservation)
+    assert got.timestep == 3 and got.must_go is True
+    assert torch.allclose(got.observation["observation.state"], obs.observation["observation.state"])
+
+    actions = [TimedAction(timestamp=float(i), timestep=i, action=torch.randn(6)) for i in range(3)]
+    got = bytes_to_python_object(python_object_to_bytes(actions))
+    assert len(got) == 3 and all(isinstance(a, TimedAction) for a in got)
+    assert torch.allclose(got[1].action, actions[1].action)
+
+    cfg = RemotePolicyConfig(
+        policy_type="act",
+        pretrained_name_or_path="lerobot/act",
+        lerobot_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,))},
+        actions_per_chunk=50,
+    )
+    got = bytes_to_python_object(python_object_to_bytes(cfg))
+    assert got.lerobot_features["observation.state"].type is FeatureType.STATE
+    assert got.actions_per_chunk == 50
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_bytes_to_python_object_is_thread_safe():
+    """Concurrent deserialization must not fail spuriously.
+
+    `torch.serialization.safe_globals` is a context manager over a module-global
+    set with no reference counting, so using it here would let the first thread
+    to exit strip the allowlist out from under threads still loading. The policy
+    server runs gRPC on four threads and deserializes observations on the hot
+    path, so that race drops observations on a robot control loop — and an
+    unauthenticated peer opening a second connection can induce it deliberately.
+    """
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
+
+    payload = python_object_to_bytes(
+        TimedObservation(timestamp=1.0, timestep=1, observation={"observation.state": torch.randn(256)})
+    )
+
+    workers = 4  # matches `PolicyServer`'s ThreadPoolExecutor
+    failures: list[str] = []
+
+    def load_repeatedly() -> None:
+        for _ in range(400):
+            try:
+                bytes_to_python_object(payload)
+            except Exception as e:  # noqa: BLE001 - the failure mode is what we assert on
+                failures.append(f"{type(e).__name__}: {e}")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda _: load_repeatedly(), range(workers)))
+
+    assert not failures, f"{len(failures)} concurrent deserializations failed, e.g. {failures[0]}"
+
+

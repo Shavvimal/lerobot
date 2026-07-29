@@ -15,10 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import io
 import json
 import logging
-import pickle  # nosec B403: Safe usage for internal serialization only
 from multiprocessing.synchronize import Event as MpEvent
 from queue import Queue
 from typing import Any
@@ -126,16 +126,106 @@ def bytes_to_state_dict(buffer: bytes) -> dict[str, torch.Tensor]:
     return torch.load(bytes_buffer, weights_only=True)
 
 
+@functools.lru_cache(maxsize=1)
+def _wire_safe_globals() -> list[Any]:
+    """Types allowed to be reconstructed from a gRPC payload.
+
+    Everything crossing the wire is either a plain scalar/container (handled by
+    the weights-only unpickler natively), a tensor, a numpy array, or one of a
+    small set of lerobot dataclasses. Anything else — in particular any callable
+    an attacker could name in a ``__reduce__`` — must be refused.
+
+    Imports are deferred: ``lerobot.async_inference`` imports this module, so
+    resolving these at module scope would be circular.
+    """
+    import numpy as np
+
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+
+    allowed: list[Any] = [FeatureType, NormalizationMode, PolicyFeature, np.ndarray, np.dtype]
+
+    # `lerobot[async]` is optional; the RL path uses this codec without it.
+    try:
+        from lerobot.async_inference.helpers import (
+            RemotePolicyConfig,
+            TimedAction,
+            TimedData,
+            TimedObservation,
+        )
+
+        allowed += [TimedData, TimedAction, TimedObservation, RemotePolicyConfig]
+    except ImportError:
+        pass
+
+    # numpy's array-reconstruction hooks. The module moved in numpy 2
+    # (`numpy.core` -> `numpy._core`), so take whichever is present.
+    for mod_name in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            mod = __import__(mod_name, fromlist=["_reconstruct"])
+        except ImportError:
+            continue
+        allowed += [fn for fn in (getattr(mod, a, None) for a in ("_reconstruct", "scalar")) if fn]
+
+    allowed += [
+        getattr(np, name)
+        for name in ("bool_", "int8", "int16", "int32", "int64", "uint8", "float16", "float32", "float64")
+        if hasattr(np, name)
+    ]
+
+    # numpy >= 2 stores an array's dtype as a concrete class from `numpy.dtypes`
+    # (e.g. `numpy.dtypes.UInt8DType`). These are inert type objects.
+    try:
+        import numpy.dtypes as np_dtypes
+
+        allowed += [getattr(np_dtypes, n) for n in dir(np_dtypes) if n.endswith("DType")]
+    except ImportError:
+        pass
+
+    return allowed
+
+
+@functools.lru_cache(maxsize=1)
+def _register_wire_safe_globals() -> None:
+    """Add the wire allowlist to torch's weights-only allowlist, once per process.
+
+    Deliberately *not* ``torch.serialization.safe_globals(...)`` as a context
+    manager. That manager unions the allowlist into a module-global set on entry
+    and set-differences it out on exit, with no reference counting, so two
+    concurrent deserializations race: the first to exit strips the allowlist out
+    from under the second, which then fails with ``UnpicklingError``. The policy
+    server runs gRPC on four threads and deserializes on the observation hot
+    path, so that race drops observations on a robot control loop — and a second
+    connection is enough for an unauthenticated peer to induce it deliberately.
+
+    Registering once and never removing is race-free, and safe to leave in place:
+    every entry is an inert type object or numpy's array-reconstruction hook,
+    none of which grant code execution to any other ``torch.load`` in the
+    process. Re-entry is harmless anyway — the underlying add is a set union.
+    """
+    torch.serialization.add_safe_globals(_wire_safe_globals())
+
+
 def python_object_to_bytes(python_object: Any) -> bytes:
-    return pickle.dumps(python_object)
+    bytes_buffer = io.BytesIO()
+    torch.save(python_object, bytes_buffer)
+    return bytes_buffer.getvalue()
 
 
 def bytes_to_python_object(buffer: bytes) -> Any:
+    """Deserialize a gRPC payload without granting it code execution.
+
+    The transport is unauthenticated plaintext gRPC, so these bytes are
+    attacker-controlled by anyone who can reach the port. A bare
+    ``pickle.load`` here executes whatever the sender names in ``__reduce__``;
+    the weights-only unpickler plus an explicit allowlist does not.
+
+    Raises:
+        pickle.UnpicklingError: if the payload references a non-allowlisted type.
+    """
+    _register_wire_safe_globals()
     bytes_buffer = io.BytesIO(buffer)
     bytes_buffer.seek(0)
-    obj = pickle.load(bytes_buffer)  # nosec B301: Safe usage of pickle.load
-    # Add validation checks here
-    return obj
+    return torch.load(bytes_buffer, weights_only=True)
 
 
 def bytes_to_transitions(buffer: bytes) -> list[Transition]:

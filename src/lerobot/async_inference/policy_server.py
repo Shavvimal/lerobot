@@ -25,7 +25,6 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
-import pickle  # nosec
 import threading
 import time
 from concurrent import futures
@@ -44,7 +43,11 @@ from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
-from lerobot.transport.utils import receive_bytes_in_chunks
+from lerobot.transport.utils import (
+    bytes_to_python_object,
+    python_object_to_bytes,
+    receive_bytes_in_chunks,
+)
 from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
@@ -122,7 +125,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         client_id = context.peer()
 
-        policy_specs = pickle.loads(request.data)  # nosec
+        policy_specs = bytes_to_python_object(request.data)
 
         if not isinstance(policy_specs, RemotePolicyConfig):
             raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
@@ -180,7 +183,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
-        timed_observation = pickle.loads(received_bytes)  # nosec
+        timed_observation = bytes_to_python_object(received_bytes)
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
@@ -233,7 +236,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
-            actions_bytes = pickle.dumps(action_chunk)  # nosec
+            actions_bytes = python_object_to_bytes(action_chunk)
             serialize_time = time.perf_counter() - start_time
 
             # Create and return the action chunk
