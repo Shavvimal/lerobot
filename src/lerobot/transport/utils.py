@@ -33,7 +33,17 @@ from . import services_pb2
 TransferState = services_pb2.TransferState  # type: ignore[attr-defined]
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB
-MAX_MESSAGE_SIZE = 4 * 1024 * 1024  # 4 MB
+MAX_MESSAGE_SIZE = 4 * 1024 * 1024  # 4 MB — gRPC's per-frame limit
+# Cap on a *reassembled* message. `MAX_MESSAGE_SIZE` bounds each individual
+# gRPC frame, but `receive_bytes_in_chunks` concatenates an unbounded number of
+# them, so only this stops an unauthenticated peer from streaming chunks until
+# the host runs out of memory. Far above any legitimate observation payload.
+MAX_REASSEMBLED_MESSAGE_BYTES = 256 * 1024 * 1024  # 256 MB
+# Model weights are the one payload class that legitimately exceeds the general
+# cap: 256 MB is only ~67M fp32 parameters, so the learner -> actor parameter
+# push would start failing at runtime on larger policies. Still bounded, so an
+# unbounded stream is refused on that path too.
+MAX_PARAMETERS_MESSAGE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 
 def bytes_buffer_size(buffer: io.BytesIO) -> int:
@@ -71,9 +81,39 @@ def send_bytes_in_chunks(buffer: bytes, message_class: Any, log_prefix: str = ""
     logging_method(f"{log_prefix} Published {sent_bytes / 1024 / 1024} MB")
 
 
-def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEvent, log_prefix: str = ""):
+def receive_bytes_in_chunks(
+    iterator,
+    queue: Queue | None,
+    shutdown_event: MpEvent,
+    log_prefix: str = "",
+    *,
+    max_message_bytes: int = MAX_REASSEMBLED_MESSAGE_BYTES,
+):
+    """Reassemble a chunked gRPC stream into a single message.
+
+    Args:
+        max_message_bytes: Hard cap on one reassembled message. The stream is
+            unauthenticated, so without a cap a peer that never sends
+            ``TRANSFER_END`` grows this buffer until the host runs out of
+            memory — on a machine that is driving a robot.
+
+    Raises:
+        ValueError: if a message exceeds ``max_message_bytes``.
+    """
     bytes_buffer = io.BytesIO()
     step = 0
+
+    def _guard_size() -> None:
+        # `tell()` rather than `bytes_buffer_size()`: the latter rewinds the
+        # buffer to position 0, which would make the next write overwrite what
+        # has already been reassembled. Called straight after a write, the
+        # position is the number of bytes accumulated.
+        size = bytes_buffer.tell()
+        if size > max_message_bytes:
+            raise ValueError(
+                f"{log_prefix} Message exceeds {max_message_bytes} bytes (got at least {size}); "
+                f"aborting reassembly."
+            )
 
     logging.info(f"{log_prefix} Starting receiver")
     for item in iterator:
@@ -86,10 +126,12 @@ def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEve
             bytes_buffer.seek(0)
             bytes_buffer.truncate(0)
             bytes_buffer.write(item.data)
+            _guard_size()
             logging.debug(f"{log_prefix} Received data at step 0")
             step = 0
         elif item.transfer_state == TransferState.TRANSFER_MIDDLE:
             bytes_buffer.write(item.data)
+            _guard_size()
             step += 1
             logging.debug(f"{log_prefix} Received data at step {step}")
         elif item.transfer_state == TransferState.TRANSFER_END:

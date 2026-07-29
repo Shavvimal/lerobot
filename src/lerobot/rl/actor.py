@@ -61,6 +61,7 @@ if TYPE_CHECKING or _grpc_available:
 
     from lerobot.transport import services_pb2, services_pb2_grpc
     from lerobot.transport.utils import (
+        MAX_PARAMETERS_MESSAGE_BYTES,
         bytes_to_state_dict,
         grpc_channel_options,
         python_object_to_bytes,
@@ -72,6 +73,7 @@ else:
     grpc = None
     services_pb2 = None
     services_pb2_grpc = None
+    MAX_PARAMETERS_MESSAGE_BYTES = None
     bytes_to_state_dict = None
     grpc_channel_options = None
     python_object_to_bytes = None
@@ -527,6 +529,9 @@ def receive_policy(
             parameters_queue,
             shutdown_event,
             log_prefix="[ACTOR] parameters",
+            # A policy state dict is the one payload that legitimately outgrows
+            # the general reassembly cap, which is only ~67M fp32 parameters.
+            max_message_bytes=MAX_PARAMETERS_MESSAGE_BYTES,
         )
 
     except grpc.RpcError as e:

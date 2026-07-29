@@ -699,3 +699,42 @@ def test_bytes_to_python_object_is_thread_safe():
     assert not failures, f"{len(failures)} concurrent deserializations failed, e.g. {failures[0]}"
 
 
+@skip_if_package_missing("grpcio", "grpc")
+def test_receive_bytes_in_chunks_rejects_oversized_message():
+    """An unauthenticated peer must not be able to exhaust host memory.
+
+    gRPC's `MAX_MESSAGE_SIZE` caps each individual frame, but the chunking
+    protocol concatenates an unbounded number of them, so only the reassembly
+    cap stops a peer that never sends TRANSFER_END.
+    """
+    from lerobot.transport.utils import receive_bytes_in_chunks, services_pb2
+
+    chunk = b"A" * 1024
+    chunks = [
+        services_pb2.InteractionMessage(data=chunk, transfer_state=services_pb2.TransferState.TRANSFER_BEGIN)
+    ]
+    chunks += [
+        services_pb2.InteractionMessage(data=chunk, transfer_state=services_pb2.TransferState.TRANSFER_MIDDLE)
+        for _ in range(20)
+    ]
+
+    with pytest.raises(ValueError, match="exceeds"):
+        receive_bytes_in_chunks(iter(chunks), Queue(), Event(), max_message_bytes=4 * 1024)
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_receive_bytes_in_chunks_allows_message_at_the_cap():
+    """The cap must not reject legitimate payloads just under it."""
+    from lerobot.transport.utils import receive_bytes_in_chunks, services_pb2
+
+    chunk = b"B" * 1024
+    chunks = [
+        services_pb2.InteractionMessage(data=chunk, transfer_state=services_pb2.TransferState.TRANSFER_BEGIN),
+        services_pb2.InteractionMessage(
+            data=chunk, transfer_state=services_pb2.TransferState.TRANSFER_MIDDLE
+        ),
+        services_pb2.InteractionMessage(data=chunk, transfer_state=services_pb2.TransferState.TRANSFER_END),
+    ]
+    queue = Queue()
+    receive_bytes_in_chunks(iter(chunks), queue, Event(), max_message_bytes=8 * 1024)
+    assert queue.get() == chunk * 3
