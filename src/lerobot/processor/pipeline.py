@@ -1070,7 +1070,6 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             try:
                 module = importlib.import_module(module_path)
                 step_class = getattr(module, class_name)
-                return step_class, class_name
             except (ImportError, AttributeError) as e:
                 raise ImportError(
                     f"Failed to load processor step '{full_class_path}'. "
@@ -1078,6 +1077,23 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
                     f"Consider registering the step using @ProcessorStepRegistry.register() for better portability. "
                     f"Error: {str(e)}"
                 ) from e
+
+            # `full_class_path` comes from a config file that may have been
+            # downloaded from the Hub, and the caller instantiates whatever we
+            # return as `step_class(**config)` — where `config` is also
+            # attacker-controlled. Without this check a config naming, say,
+            # `subprocess.Popen` would be imported and called. Resolving to a
+            # real ProcessorStep subclass is a property every legitimate step
+            # already has.
+            if not (isinstance(step_class, type) and issubclass(step_class, ProcessorStep)):
+                raise ImportError(
+                    f"Refusing to load processor step '{full_class_path}': resolved object is "
+                    f"{step_class!r}, which is not a ProcessorStep subclass. Processor configs "
+                    f"can originate from untrusted Hub repositories, so only ProcessorStep "
+                    f"subclasses may be instantiated from them."
+                )
+
+            return step_class, class_name
 
     @classmethod
     def _instantiate_step(
