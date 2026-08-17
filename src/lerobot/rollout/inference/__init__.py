@@ -21,6 +21,7 @@ rollout strategies never branch on which backend is in use.
 from .base import InferenceEngine
 from .factory import (
     InferenceEngineConfig,
+    RemoteRTCInferenceConfig,
     RTCInferenceConfig,
     SyncInferenceConfig,
     create_inference_engine,
@@ -28,9 +29,14 @@ from .factory import (
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
+# NOTE: RemoteRTCInferenceEngine is deliberately NOT imported here — it needs
+# grpcio (an optional extra). The factory imports it lazily when
+# --inference.type=remote_rtc is selected.
+
 __all__ = [
     "InferenceEngine",
     "InferenceEngineConfig",
+    "RemoteRTCInferenceConfig",
     "RTCInferenceConfig",
     "RTCInferenceEngine",
     "SyncInferenceConfig",

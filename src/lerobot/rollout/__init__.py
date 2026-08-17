@@ -41,6 +41,7 @@ from .context import (
 from .inference import (
     InferenceEngine,
     InferenceEngineConfig,
+    RemoteRTCInferenceConfig,
     RTCInferenceConfig,
     RTCInferenceEngine,
     SyncInferenceConfig,
@@ -74,6 +75,7 @@ __all__ = [
     "InferenceEngineConfig",
     "PolicyContext",
     "ProcessorContext",
+    "RemoteRTCInferenceConfig",
     "RTCInferenceConfig",
     "RTCInferenceEngine",
     "RolloutConfig",

@@ -738,3 +738,33 @@ def test_receive_bytes_in_chunks_allows_message_at_the_cap():
     queue = Queue()
     receive_bytes_in_chunks(iter(chunks), queue, Event(), max_message_bytes=8 * 1024)
     assert queue.get() == chunk * 3
+
+
+def test_remote_rtc_payloads_roundtrip_without_allowlist_changes():
+    """The remote-RTC wire protocol uses only plain dicts of natively-safe
+    types; this pins that no _wire_safe_globals additions are needed."""
+    import numpy as np
+    import torch
+
+    from lerobot.transport.utils import bytes_to_python_object, python_object_to_bytes
+
+    predict_request = {
+        "obs_frame": {
+            "observation.images.front": np.zeros((480, 640, 3), dtype=np.uint8),
+            "observation.state": np.arange(6, dtype=np.float32),
+        },
+        "robot_type": "so101_follower",
+        "inference_delay": 2,
+        "prev_chunk_left_over": torch.zeros(10, 6),
+    }
+    decoded = bytes_to_python_object(python_object_to_bytes(predict_request))
+    assert decoded["inference_delay"] == 2
+    assert decoded["obs_frame"]["observation.images.front"].shape == (480, 640, 3)
+    assert torch.equal(decoded["prev_chunk_left_over"], torch.zeros(10, 6))
+
+    predict_request["prev_chunk_left_over"] = None
+    assert bytes_to_python_object(python_object_to_bytes(predict_request))["prev_chunk_left_over"] is None
+
+    predict_response = {"original": torch.randn(50, 6), "processed": torch.randn(50, 6)}
+    decoded = bytes_to_python_object(python_object_to_bytes(predict_response))
+    assert torch.equal(decoded["original"], predict_response["original"])

@@ -53,6 +53,7 @@ from lerobot.utils.import_utils import _peft_available, require_package
 from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
+    RemoteRTCInferenceConfig,
     RTCInferenceConfig,
     SyncInferenceConfig,
     create_inference_engine,
@@ -121,11 +122,16 @@ class HardwareContext:
 
 @dataclass
 class PolicyContext:
-    """Loaded policy and its inference engine."""
+    """Loaded policy and its inference engine.
 
-    policy: PreTrainedPolicy
-    preprocessor: PolicyProcessorPipeline
-    postprocessor: PolicyProcessorPipeline
+    ``policy`` and the pipelines are ``None`` for remote inference backends,
+    where the model and its processors live on the server. Strategies only
+    ever read ``.inference``.
+    """
+
+    policy: PreTrainedPolicy | None
+    preprocessor: PolicyProcessorPipeline | None
+    postprocessor: PolicyProcessorPipeline | None
     inference: InferenceEngine
 
 
@@ -209,43 +215,63 @@ def build_rollout_context(
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    is_remote = isinstance(cfg.inference, RemoteRTCInferenceConfig)
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
-    logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
+    # For remote inference the weights and processors live on the server;
+    # cfg.policy is still resolved locally (config.json only) so feature
+    # names, action ordering, and validation all work unchanged.
     policy_config = cfg.policy
 
-    if hasattr(policy_config, "compile_model"):
-        policy_config.compile_model = cfg.use_torch_compile
-
-    if policy_config.type == "vqbet" and cfg.device == "mps":
-        raise NotImplementedError(
-            "Current implementation of VQBeT does not support `mps` backend. "
-            "Please use `cpu` or `cuda` backend."
+    if is_remote:
+        policy = None
+        if getattr(policy_config, "use_relative_actions", False):
+            raise NotImplementedError(
+                "remote_rtc does not support policies with relative actions yet."
+            )
+        if cfg.use_torch_compile:
+            logger.warning("remote_rtc: --use_torch_compile is a server-side concern; ignoring.")
+        logger.info(
+            "Remote inference: skipping local policy load (type=%s); client-side device is cpu",
+            policy_config.type,
         )
+    else:
+        logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
 
-    policy = _load_pretrained_policy(policy_config)
+        if hasattr(policy_config, "compile_model"):
+            policy_config.compile_model = cfg.use_torch_compile
 
-    if is_rtc:
-        policy.config.rtc_config = cfg.inference.rtc
-        if hasattr(policy, "init_rtc_processor"):
-            policy.init_rtc_processor()
+        if policy_config.type == "vqbet" and cfg.device == "mps":
+            raise NotImplementedError(
+                "Current implementation of VQBeT does not support `mps` backend. "
+                "Please use `cpu` or `cuda` backend."
+            )
 
-    policy = policy.to(cfg.device)
-    policy.eval()
-    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+        policy = _load_pretrained_policy(policy_config)
 
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        try:
-            if hasattr(torch, "compile"):
-                compile_kwargs = {
-                    "backend": cfg.torch_compile_backend,
-                    "mode": cfg.torch_compile_mode,
-                    "options": {"triton.cudagraphs": False},
-                }
-                policy.predict_action_chunk = torch.compile(policy.predict_action_chunk, **compile_kwargs)
-                logger.info("torch.compile applied to predict_action_chunk")
-        except Exception as e:
-            logger.warning("Failed to apply torch.compile: %s", e)
+        if is_rtc:
+            policy.config.rtc_config = cfg.inference.rtc
+            if hasattr(policy, "init_rtc_processor"):
+                policy.init_rtc_processor()
+
+        policy = policy.to(cfg.device)
+        policy.eval()
+        logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+
+        if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+            try:
+                if hasattr(torch, "compile"):
+                    compile_kwargs = {
+                        "backend": cfg.torch_compile_backend,
+                        "mode": cfg.torch_compile_mode,
+                        "options": {"triton.cudagraphs": False},
+                    }
+                    policy.predict_action_chunk = torch.compile(
+                        policy.predict_action_chunk, **compile_kwargs
+                    )
+                    logger.info("torch.compile applied to predict_action_chunk")
+            except Exception as e:
+                logger.warning("Failed to apply torch.compile: %s", e)
 
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (
@@ -418,32 +444,37 @@ def build_rollout_context(
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
 
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
-    dataset_stats = None
-    if dataset is not None:
-        dataset_stats = rename_stats(
-            dataset.meta.stats,
-            cfg.rename_map,
+    # For remote inference the server builds its own pipelines from the
+    # checkpoint (the client's rename_map is forwarded in the Setup RPC).
+    if is_remote:
+        preprocessor, postprocessor = None, None
+    else:
+        dataset_stats = None
+        if dataset is not None:
+            dataset_stats = rename_stats(
+                dataset.meta.stats,
+                cfg.rename_map,
+            )
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=cfg.policy.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
         )
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy_config,
-        pretrained_path=cfg.policy.pretrained_path,
-        pretrained_revision=policy_config.pretrained_revision,
-        dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
-    )
-
-    if isinstance(cfg.inference, SyncInferenceConfig) and any(
-        isinstance(step, RelativeActionsProcessorStep) and step.enabled
-        for step in getattr(preprocessor, "steps", ())
-    ):
-        raise NotImplementedError(
-            "SyncInferenceEngine does not support policies with relative actions for now."
-            "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
-        )
+        if isinstance(cfg.inference, SyncInferenceConfig) and any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        ):
+            raise NotImplementedError(
+                "SyncInferenceEngine does not support policies with relative actions for now."
+                "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+            )
 
     # --- 7. Inference strategy (needs policy + pre/post + hardware) --
     logger.info(
@@ -463,9 +494,12 @@ def build_rollout_context(
         task=task_str,
         fps=cfg.fps,
         device=cfg.device,
-        use_torch_compile=cfg.use_torch_compile,
+        use_torch_compile=cfg.use_torch_compile and not is_remote,
         compile_warmup_inferences=cfg.compile_warmup_inferences,
         shutdown_event=shutdown_event,
+        policy_type=policy_config.type,
+        pretrained_path=str(cfg.policy.pretrained_path),
+        rename_map=cfg.rename_map,
     )
 
     # --- 8. Assemble ---------------------------------------------------

@@ -460,3 +460,58 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+# ---------------------------------------------------------------------------
+# Remote RTC config + factory dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_remote_rtc_config():
+    from lerobot.rollout import RemoteRTCInferenceConfig, RTCInferenceConfig
+
+    cfg = RemoteRTCInferenceConfig(server_address="10.0.0.1:9032")
+    assert cfg.type == "remote_rtc"
+    # Inherits the full RTC surface so --inference.rtc.* flags apply unchanged.
+    assert isinstance(cfg, RTCInferenceConfig)
+    assert cfg.queue_threshold == 30
+    assert cfg.rtc.execution_horizon == 10
+    assert cfg.warmup_inferences == 1
+
+    with pytest.raises(ValueError, match="server_address"):
+        RemoteRTCInferenceConfig()
+
+
+def test_remote_rtc_factory_dispatch_order():
+    """RemoteRTCInferenceConfig subclasses RTCInferenceConfig: the factory must
+    dispatch on the subclass FIRST or a remote config silently builds a local
+    RTC engine. This test pins that ordering forever."""
+    pytest.importorskip("grpc")
+    from unittest.mock import MagicMock
+
+    from lerobot.rollout.inference import (
+        RemoteRTCInferenceConfig,
+        RTCInferenceConfig,
+        create_inference_engine,
+    )
+    from lerobot.rollout.inference.remote_rtc import RemoteRTCInferenceEngine
+    from lerobot.rollout.inference.rtc import RTCInferenceEngine
+
+    common = dict(
+        policy=None,
+        preprocessor=None,
+        postprocessor=None,
+        robot_wrapper=MagicMock(),
+        hw_features={},
+        dataset_features={},
+        ordered_action_keys=[f"j{i}.pos" for i in range(6)],
+        task="t",
+        fps=30.0,
+        device=None,
+    )
+
+    remote = create_inference_engine(RemoteRTCInferenceConfig(server_address="10.0.0.1:9032"), **common)
+    assert type(remote) is RemoteRTCInferenceEngine
+
+    local = create_inference_engine(RTCInferenceConfig(), **common)
+    assert type(local) is RTCInferenceEngine

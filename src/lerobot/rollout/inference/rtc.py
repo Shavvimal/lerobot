@@ -92,9 +92,9 @@ class RTCInferenceEngine(InferenceEngine):
 
     def __init__(
         self,
-        policy: PreTrainedPolicy,
-        preprocessor: PolicyProcessorPipeline,
-        postprocessor: PolicyProcessorPipeline,
+        policy: PreTrainedPolicy | None,
+        preprocessor: PolicyProcessorPipeline | None,
+        postprocessor: PolicyProcessorPipeline | None,
         robot_wrapper: ThreadSafeRobot,
         rtc_config: RTCConfig,
         hw_features: dict,
@@ -115,6 +115,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._task = task
         self._fps = fps
         self._device = device or "cpu"
+        self._policy_device = torch.device(self._device)
         self._use_torch_compile = use_torch_compile
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
@@ -129,24 +130,35 @@ class RTCInferenceEngine(InferenceEngine):
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
 
-        if not self._use_torch_compile:
+        # Number of initial inferences excluded from latency tracking (their
+        # measured latency is reset instead of recorded). LatencyTracker.max()
+        # is monotonic — it never decays — so a one-off cold-start spike
+        # (torch.compile, CUDA kernel warmup, first remote round-trip) would
+        # otherwise pin ``inference_delay`` high for the whole session.
+        # Subclasses may raise this even without torch.compile.
+        self._warmup_count = max(1, compile_warmup_inferences) if use_torch_compile else 0
+        if self._warmup_count == 0:
             self._compile_warmup_done.set()
-            logger.info("RTCInferenceEngine initialized (torch.compile disabled, no warmup needed)")
+            logger.info("RTCInferenceEngine initialized (no warmup needed)")
         else:
             logger.info(
-                "RTCInferenceEngine initialized (torch.compile enabled, %d warmup inferences)",
-                compile_warmup_inferences,
+                "RTCInferenceEngine initialized (%d warmup inferences)",
+                self._warmup_count,
             )
 
         # Processor introspection for relative-action re-anchoring.
-        self._relative_step = next(
-            (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
-            None,
-        )
-        self._normalizer_step = next(
-            (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
-            None,
-        )
+        if preprocessor is not None:
+            self._relative_step = next(
+                (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
+                None,
+            )
+            self._normalizer_step = next(
+                (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
+                None,
+            )
+        else:
+            self._relative_step = None
+            self._normalizer_step = None
         if self._relative_step is not None:
             if self._relative_step.action_names is None:
                 cfg_names = getattr(policy.config, "action_feature_names", None)
@@ -219,11 +231,18 @@ class RTCInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Reset the policy, processors, and action queue."""
         logger.info("Resetting RTC inference state (policy + processors + queue)")
-        self._policy.reset()
-        self._preprocessor.reset()
-        self._postprocessor.reset()
+        self._reset_inference_state()
         if self._action_queue is not None:
             self._action_queue.clear()
+
+    def _reset_inference_state(self) -> None:
+        """Reset the components that produce chunks (overridable for remote backends)."""
+        if self._policy is not None:
+            self._policy.reset()
+        if self._preprocessor is not None:
+            self._preprocessor.reset()
+        if self._postprocessor is not None:
+            self._postprocessor.reset()
 
     # ------------------------------------------------------------------
     # Action production (called from main thread)
@@ -241,6 +260,58 @@ class RTCInferenceEngine(InferenceEngine):
             self._obs_holder["obs"] = obs
 
     # ------------------------------------------------------------------
+    # RTC: chunk production (overridable for remote backends)
+    # ------------------------------------------------------------------
+
+    def _run_inference(
+        self,
+        obs: dict,
+        inference_delay: int,
+        prev_actions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Produce one ``(original, processed)`` action chunk pair.
+
+        ``original`` is the raw policy output in model space (feeds the next
+        call's ``prev_chunk_left_over``); ``processed`` is the postprocessed
+        chunk the robot executes. Both are ``(T, A)``.
+        """
+        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+        obs_batch = prepare_observation_for_inference(
+            obs_batch, self._policy_device, self._task, self._robot.robot_type
+        )
+        obs_batch["task"] = [self._task]
+
+        preprocessed = self._preprocessor(obs_batch)
+
+        if prev_actions is not None and self._relative_step is not None:
+            # Rebase against the raw cached state so the leftover tail stays in
+            # the training-time coordinate frame.
+            raw_state = self._relative_step.get_cached_state()
+            if raw_state is not None:
+                prev_abs = self._action_queue.get_processed_left_over()
+                if prev_abs is not None and prev_abs.numel() > 0:
+                    prev_actions = reanchor_relative_rtc_prefix(
+                        prev_actions_absolute=prev_abs,
+                        current_state=raw_state,
+                        relative_step=self._relative_step,
+                        normalizer_step=self._normalizer_step,
+                        policy_device=self._policy_device,
+                    )
+
+        if prev_actions is not None:
+            prev_actions = _normalize_prev_actions_length(
+                prev_actions, target_steps=self._rtc_config.execution_horizon
+            )
+
+        actions = self._policy.predict_action_chunk(
+            preprocessed, inference_delay=inference_delay, prev_chunk_left_over=prev_actions
+        )
+
+        original = actions.squeeze(0).clone()
+        processed = self._postprocessor(actions).squeeze(0)
+        return original, processed
+
+    # ------------------------------------------------------------------
     # RTC: background inference thread
     # ------------------------------------------------------------------
 
@@ -249,9 +320,8 @@ class RTCInferenceEngine(InferenceEngine):
         try:
             latency_tracker = LatencyTracker()
             time_per_chunk = 1.0 / self._fps
-            policy_device = torch.device(self._device)
 
-            warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
+            warmup_required = self._warmup_count
             inference_count = 0
             consecutive_errors = 0
 
@@ -276,46 +346,13 @@ class RTCInferenceEngine(InferenceEngine):
                         latency = latency_tracker.max()
                         delay = math.ceil(latency / time_per_chunk) if latency else 0
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
-                        obs_batch = prepare_observation_for_inference(
-                            obs_batch, policy_device, self._task, self._robot.robot_type
-                        )
-                        obs_batch["task"] = [self._task]
-
-                        preprocessed = self._preprocessor(obs_batch)
-
-                        if prev_actions is not None and self._relative_step is not None:
-                            # Rebase against the raw cached state so the leftover tail stays in
-                            # the training-time coordinate frame.
-                            raw_state = self._relative_step.get_cached_state()
-                            if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
-                                if prev_abs is not None and prev_abs.numel() > 0:
-                                    prev_actions = reanchor_relative_rtc_prefix(
-                                        prev_actions_absolute=prev_abs,
-                                        current_state=raw_state,
-                                        relative_step=self._relative_step,
-                                        normalizer_step=self._normalizer_step,
-                                        policy_device=policy_device,
-                                    )
-
-                        if prev_actions is not None:
-                            prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
-                            )
-
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
-                        )
-
-                        original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
+                        original, processed = self._run_inference(obs, delay, prev_actions)
                         new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
 
                         inference_count += 1
                         consecutive_errors = 0
-                        is_warmup = self._use_torch_compile and inference_count <= warmup_required
+                        is_warmup = warmup_required > 0 and inference_count <= warmup_required
                         if is_warmup:
                             latency_tracker.reset()
                         else:
