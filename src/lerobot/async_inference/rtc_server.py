@@ -63,7 +63,11 @@ from lerobot.transport.remote_rtc_spec import (
 )
 from lerobot.transport.utils import bytes_to_python_object, grpc_channel_options, python_object_to_bytes
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# force=True: transitively imported modules may already have configured the
+# root logger, which would silently swallow every INFO line below.
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True
+)
 logger = logging.getLogger(__name__)
 
 SUPPORTED_POLICY_TYPES = {"pi05"}
