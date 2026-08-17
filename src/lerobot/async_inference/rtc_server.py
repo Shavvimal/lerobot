@@ -33,7 +33,8 @@ checkpoints readable by this process and run inference. Payloads are decoded
 with the weights-only unpickler from ``lerobot.transport.utils``.
 """
 
-from __future__ import annotations
+# NOTE: no `from __future__ import annotations` here — draccus.wrap() needs the
+# config dataclass annotation resolved at decoration time, not as a string.
 
 import logging
 import signal
