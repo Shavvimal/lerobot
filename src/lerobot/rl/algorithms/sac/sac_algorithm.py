@@ -348,6 +348,10 @@ class SACAlgorithm(RLAlgorithm):
         actions_discrete: Tensor = actions[:, DISCRETE_DIMENSION_INDEX:].clone()
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
+        # Defensive clamp: an out-of-range index here (e.g. a -1 leaking from an
+        # intervention/normalization path) is a device-side assert that kills
+        # the whole CUDA context and takes the learner down with it.
+        actions_discrete = actions_discrete.clamp_(0, self.policy_config.num_discrete_actions - 1)
 
         discrete_penalties: Tensor | None = None
         if complementary_info is not None:

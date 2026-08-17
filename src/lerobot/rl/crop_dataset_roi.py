@@ -228,15 +228,23 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
             new_frame[key] = value
 
         new_frame["task"] = task
-        new_dataset.add_frame(new_frame)
 
+        # Close out the previous episode BEFORE adding the first frame of the
+        # next one — adding first put each episode's first frame into the
+        # previous episode's buffer (off-by-one at every boundary).
         if frame["episode_index"].item() != prev_episode_index:
-            # Save the episode
             new_dataset.save_episode()
             prev_episode_index = frame["episode_index"].item()
 
+        new_dataset.add_frame(new_frame)
+
     # Save the last episode
     new_dataset.save_episode()
+
+    # Flush buffered episode metadata — save_episode() batches it, and without
+    # this datasets with >10 episodes end up with truncated meta/episodes
+    # (loader sees 10 episodes, IndexError on the 11th).
+    new_dataset.finalize()
 
     if push_to_hub:
         new_dataset.push_to_hub()

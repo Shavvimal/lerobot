@@ -176,3 +176,17 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# local hardware diagnostics (not for upstream)
+wrist_diag.py
+wrist_probe.py
+wrist_sign.py
+scan_bus.py
+camera_probe.py
+dataset_audit.py
+kiyo_setup.sh
+uvc-util
+
+# HIL-SERL local bench files (not for upstream)
+urdf/
+hilserl/

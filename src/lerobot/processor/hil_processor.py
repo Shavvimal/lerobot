@@ -571,8 +571,14 @@ class RewardClassifierProcessorStep(ProcessorStep):
     success_threshold: float = 0.5
     success_reward: float = 1.0
     terminate_on_success: bool = True
+    # Debounce: number of consecutive over-threshold frames required before
+    # success fires. A single borderline frame (camera noise on a
+    # block-under-jaws scene) must not end an episode with reward 1; real
+    # holds sustain p>0.95 for many frames, noise spikes last one.
+    min_consecutive_success: int = 3
 
     reward_classifier: Any = None
+    _success_streak: int = 0
 
     def __post_init__(self):
         """Initializes the reward classifier model after the dataclass is created."""
@@ -605,6 +611,14 @@ class RewardClassifierProcessorStep(ProcessorStep):
         if not images:
             return new_transition
 
+        # This step runs BEFORE DeviceProcessorStep in the env pipeline, so
+        # observations are still on CPU while the classifier sits on
+        # self.device — move them or conv2d fails on non-CUDA accelerators.
+        images = {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            for key, value in images.items()
+        }
+
         # Run reward classifier
         start_time = time.perf_counter()
         with torch.inference_mode():
@@ -617,6 +631,12 @@ class RewardClassifierProcessorStep(ProcessorStep):
         terminated = new_transition.get(TransitionKey.DONE, False)
 
         if math.isclose(success, 1, abs_tol=1e-2):
+            self._success_streak += 1
+        else:
+            self._success_streak = 0
+
+        if self._success_streak >= self.min_consecutive_success:
+            self._success_streak = 0
             reward = self.success_reward
             if self.terminate_on_success:
                 terminated = True

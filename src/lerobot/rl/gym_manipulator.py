@@ -509,6 +509,11 @@ def make_processors(
             ),
             EEBoundsAndSafety(
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+                # Rate-limit oversized per-frame steps instead of crashing the loop:
+                # episode auto-reset moves the arm >5cm from the previous episode's
+                # last commanded EE pose, which trips the jump check on the first
+                # frame of every episode that ends far from the reset hover.
+                raise_on_jump=False,
             ),
             GripperVelocityToJoint(
                 clip_max=cfg.processor.max_gripper_pos,

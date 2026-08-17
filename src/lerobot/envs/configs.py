@@ -281,7 +281,9 @@ class GripperConfig:
 class ResetConfig:
     """Configuration for environment reset behavior."""
 
-    fixed_reset_joint_positions: Any | None = None
+    # Typed concretely (was `Any | None`): draccus encode_dataclass does
+    # isinstance() against the annotation, and typing.Any raises TypeError.
+    fixed_reset_joint_positions: list[float] | None = None
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True

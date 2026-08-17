@@ -205,6 +205,9 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         logging.info("[ACTOR] Policy loop finished")
     except Exception:
         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
+        import traceback
+
+        traceback.print_exc()  # log formatter swallows exc_info; print raw
         shutdown_event.set()
     finally:
         logging.info("[ACTOR] Closing queues")
