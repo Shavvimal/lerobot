@@ -48,6 +48,7 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Generator
 from functools import lru_cache
@@ -522,6 +523,7 @@ def receive_policy(
 
     try:
         iterator = learner_client.StreamParameters(services_pb2.Empty())
+        _cancel_stream_on_shutdown(iterator, shutdown_event)
         receive_bytes_in_chunks(
             iterator,
             parameters_queue,
@@ -530,11 +532,33 @@ def receive_policy(
         )
 
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        if shutdown_event.is_set() and e.code() == grpc.StatusCode.CANCELLED:
+            logging.info("[ACTOR] Parameter stream cancelled on shutdown")
+        else:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
     if not use_threads(cfg):
         grpc_channel.close()
     logging.info("[ACTOR] Received policy loop stopped")
+
+
+def _cancel_stream_on_shutdown(call: Any, shutdown_event: Any, poll_s: float = 0.5) -> threading.Thread:
+    """Cancel a server-streaming gRPC call once ``shutdown_event`` is set.
+
+    The parameter stream only yields when the learner pushes new weights, so a receiver blocked on it
+    cannot see the shutdown event on its own. Without this, the actor hangs on join after a crash
+    whenever the learner is idle, and keeps holding the robot and cameras.
+    """
+
+    def _watch() -> None:
+        while not shutdown_event.wait(timeout=poll_s):
+            if call.done():
+                return
+        call.cancel()
+
+    watcher = threading.Thread(target=_watch, name="actor-parameters-stream-cancel", daemon=True)
+    watcher.start()
+    return watcher
 
 
 def send_transitions(
