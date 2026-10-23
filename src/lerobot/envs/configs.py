@@ -248,6 +248,8 @@ class RewardClassifierConfig:
     pretrained_path: str | None = None
     success_threshold: float = 0.5
     success_reward: float = 1.0
+    # Values above 1 stop a single noisy frame near the success boundary from ending the episode.
+    min_consecutive_success: int = 1
 
 
 @dataclass

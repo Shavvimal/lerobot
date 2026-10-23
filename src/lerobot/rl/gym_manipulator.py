@@ -477,6 +477,7 @@ def make_processors(
                 success_threshold=cfg.processor.reward_classifier.success_threshold,
                 success_reward=cfg.processor.reward_classifier.success_reward,
                 terminate_on_success=terminate_on_success,
+                min_consecutive_success=cfg.processor.reward_classifier.min_consecutive_success,
             )
         )
 
