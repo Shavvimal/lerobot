@@ -462,3 +462,69 @@ def test_actor_side_algorithm_select_action_and_load_weights():
     # Simulate receiving weights from learner
     fake_weights = algorithm.get_weights()
     algorithm.load_weights(fake_weights, device="cpu")
+
+
+@skip_if_package_missing("grpcio", "grpc")
+@pytest.mark.timeout(10)
+def test_receive_policy_stops_on_actor_shutdown_while_learner_is_idle(cfg, monkeypatch):
+    """The actor must not hang in its parameter stream after its own shutdown.
+
+    When the actor crashes it sets its shutdown event and joins ``receive_policy``. If the learner
+    has no new parameters to push (e.g. it has not started learning), the gRPC stream yields nothing,
+    so the receiver has to cancel the call itself instead of waiting for the next message.
+    """
+    import grpc
+
+    from lerobot.rl.actor import establish_learner_connection, learner_service_client, receive_policy
+    from lerobot.rl.learner import start_learner
+    from lerobot.rl.learner_service import LearnerService
+
+    # Signals once the learner has entered StreamParameters, so shutdown is only set mid-stream.
+    stream_entered = threading.Event()
+    original_stream_parameters = LearnerService.StreamParameters
+
+    def stream_parameters(self, request, context):
+        stream_entered.set()
+        yield from original_stream_parameters(self, request, context)
+
+    monkeypatch.setattr(LearnerService, "StreamParameters", stream_parameters)
+
+    learner_shutdown_event = Event()
+    actor_shutdown_event = Event()
+
+    # The learner's parameters queue stays empty, so StreamParameters never yields.
+    learner_thread = threading.Thread(
+        target=start_learner,
+        args=(Queue(), Queue(), Queue(), learner_shutdown_event, cfg),
+    )
+    learner_thread.start()
+
+    policy_cfg = cfg.policy
+    learner_client, channel = learner_service_client(
+        host=policy_cfg.actor_learner_config.learner_host, port=policy_cfg.actor_learner_config.learner_port
+    )
+    try:
+        assert establish_learner_connection(learner_client, actor_shutdown_event, attempts=5)
+
+        # Keep a handle on the client-side call to check how it ended.
+        calls = []
+        open_stream = learner_client.StreamParameters
+        learner_client.StreamParameters = lambda request: calls.append(open_stream(request)) or calls[-1]
+
+        receive_params_thread = threading.Thread(
+            target=receive_policy,
+            args=(cfg, Queue(), actor_shutdown_event, learner_client, channel),
+            daemon=True,
+        )
+        receive_params_thread.start()
+        assert stream_entered.wait(timeout=5), "the learner never opened the parameter stream"
+        assert receive_params_thread.is_alive()
+
+        actor_shutdown_event.set()
+        receive_params_thread.join(timeout=3)
+        assert not receive_params_thread.is_alive(), "receive_policy did not stop after actor shutdown"
+        assert calls[0].code() == grpc.StatusCode.CANCELLED
+    finally:
+        learner_shutdown_event.set()
+        learner_thread.join()
+        channel.close()
