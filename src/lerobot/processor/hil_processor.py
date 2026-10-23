@@ -591,7 +591,11 @@ class RewardClassifierProcessorStep(ProcessorStep):
         success_threshold: The probability threshold to consider a prediction as successful.
         success_reward: The reward value to assign on success.
         terminate_on_success: If True, terminates the episode upon successful classification.
+        min_consecutive_success: The number of consecutive frames the classifier must predict success
+            before the step grants the reward. The default of 1 grants it on the first such frame.
+            A higher value stops a single noisy frame from ending the episode.
         reward_classifier: The loaded classifier model instance.
+        success_streak: The number of consecutive frames predicted as successful in the active episode.
     """
 
     pretrained_path: str | None = None
@@ -599,11 +603,15 @@ class RewardClassifierProcessorStep(ProcessorStep):
     success_threshold: float = 0.5
     success_reward: float = 1.0
     terminate_on_success: bool = True
+    min_consecutive_success: int = 1
 
     reward_classifier: Any = None
+    success_streak: int = 0
 
     def __post_init__(self):
         """Initializes the reward classifier model after the dataclass is created."""
+        if self.min_consecutive_success < 1:
+            raise ValueError(f"min_consecutive_success must be >= 1, got {self.min_consecutive_success}")
         if self.pretrained_path is not None:
             from lerobot.rewards.classifier.modeling_classifier import Classifier
 
@@ -645,6 +653,11 @@ class RewardClassifierProcessorStep(ProcessorStep):
         terminated = new_transition.get(TransitionKey.DONE, False)
 
         if math.isclose(success, 1, abs_tol=1e-2):
+            self.success_streak += 1
+        else:
+            self.success_streak = 0
+
+        if self.success_streak >= self.min_consecutive_success:
             reward = self.success_reward
             if self.terminate_on_success:
                 terminated = True
@@ -674,7 +687,12 @@ class RewardClassifierProcessorStep(ProcessorStep):
             "success_threshold": self.success_threshold,
             "success_reward": self.success_reward,
             "terminate_on_success": self.terminate_on_success,
+            "min_consecutive_success": self.min_consecutive_success,
         }
+
+    def reset(self) -> None:
+        """Resets the success streak, typically called at the start of a new episode."""
+        self.success_streak = 0
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

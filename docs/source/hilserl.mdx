@@ -122,6 +122,7 @@ class RewardClassifierConfig:
     pretrained_path: str | None = None    # Path to pretrained reward classifier
     success_threshold: float = 0.5    # Success detection threshold
     success_reward: float = 1.0    # Reward value for successful episodes
+    min_consecutive_success: int = 1    # Consecutive success frames required before the reward fires
 
 # Dataset configuration
 class DatasetConfig:
@@ -774,7 +775,8 @@ or set the argument in the json config file.
       "reward_classifier": {
         "pretrained_path": "path_to_your_pretrained_model",
         "success_threshold": 0.7,
-        "success_reward": 1.0
+        "success_reward": 1.0,
+        "min_consecutive_success": 3
       },
       "reset": {
         "terminate_on_success": true
@@ -791,6 +793,8 @@ python -m lerobot.rl.gym_manipulator --config_path path/to/env_config.json
 ```
 
 The reward classifier will automatically provide rewards based on the visual input from the robot's cameras.
+
+By default a single frame above `success_threshold` grants the reward and, with `terminate_on_success`, ends the episode. Near a borderline state (for example, a gripper resting just above the object), camera noise can push one frame over the threshold and end the episode with a false success. Set `min_consecutive_success` to a value above 1 (for example 3) so that the classifier must predict success on that many consecutive frames first.
 
 **Example Workflow for training the reward classifier**
 
